@@ -915,8 +915,8 @@ static MZ_FORCEINLINE mz_uint tdefl_match_length(const mz_uint8 *p, const mz_uin
 static TDEFL_NOINLINE mz_uint tdefl_find_match_long(const tdefl_compressor *d, mz_uint lookahead_pos, mz_uint max_dist, mz_uint max_match_len, mz_uint match_len, mz_uint num_probes_left)
 {
     const mz_uint pos = lookahead_pos & TDEFL_LZ_DICT_SIZE_MASK;
-    const mz_uint dist_base = max_dist - lookahead_pos;
-    const mz_uint16 max_dist16 = (mz_uint16)max_dist;
+    mz_uint dist_base = max_dist - lookahead_pos;
+    mz_uint16 max_dist16 = (mz_uint16)max_dist;
     mz_uint dist, probe_len, found = 0;
     size_t probe_pos = pos;
     const mz_uint8 *pTail = d->m_dict + match_len - 1;
@@ -962,7 +962,19 @@ static TDEFL_NOINLINE mz_uint tdefl_find_match_long(const tdefl_compressor *d, m
     }
     /* Two versions of the same loop: where position 0 lies beyond max_dist, the distance test alone
        ends the chain on a null m_next, and the zero test is left out. */
-    if ((mz_uint16)lookahead_pos > max_dist)
+    /* A third case shares the first loop (task miniz-0010): where (mz_uint16)lookahead_pos equals
+       max_dist (the start of a stream, as long as the dictionary holds everything read so far) and
+       max_dist is not 0, the links within reach are exactly 1..max_dist: with L = max_dist,
+       (mz_uint16)(L - n) <= L holds for n in 0..L only, and 0 ends the chain. That is one range again,
+       (mz_uint16)(n - 1) <= max_dist - 1, which the distance test alone makes once its base and its
+       bound are both lowered by 1. */
+    if (((mz_uint16)lookahead_pos == max_dist) && max_dist)
+    {
+        dist_base--;
+        max_dist16--;
+        TDEFL_PROBE_LOOP(TDEFL_CHAIN_END_FAR)
+    }
+    else if ((mz_uint16)lookahead_pos > max_dist)
     {
         TDEFL_PROBE_LOOP(TDEFL_CHAIN_END_FAR)
     }
@@ -1014,6 +1026,16 @@ static MZ_FORCEINLINE void tdefl_find_match(tdefl_compressor *d, mz_uint lookahe
             __builtin_prefetch(&d->m_next[d->m_next[next_first] & TDEFL_LZ_DICT_SIZE_MASK]);
         }
 #endif
+        /* The first probe, in line (task miniz-0010): a chain that is empty, or whose first link lies
+           beyond max_dist, ends the search before any comparison (the budget is 3 or more here, so the
+           first decrement never ends it). The general search then finds nothing: the call and its
+           setup are paid only by the chains that hold a link within reach. Same test as the first
+           probe of tdefl_find_match_long, which makes it again. */
+        {
+            const mz_uint first = d->m_next[lookahead_pos & TDEFL_LZ_DICT_SIZE_MASK];
+            if ((!first) || ((mz_uint16)(lookahead_pos - first) > max_dist))
+                return;
+        }
         found = tdefl_find_match_long(d, lookahead_pos, max_dist, max_match_len, match_len, num_probes_left);
         if (found)
         {
