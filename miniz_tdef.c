@@ -1111,8 +1111,12 @@ static TDEFL_NOINLINE mz_uint tdefl_find_match_long(const tdefl_compressor *d, m
    so the budget is decremented once at the start and the loop is entered after both. The state handed
    on is (num_probes_left << 16) | probe_pos: probe_pos is masked (below 32768), and a budget is at most
    1 + (0xFFF + 2) / 3 = 1366. tdefl_find_match_long takes dist_base and pTail, from which it finds
-   lookahead_pos and match_len again, so that this loop keeps neither. */
-static TDEFL_NOINLINE mz_uint tdefl_find_match_first(const tdefl_compressor *d, mz_uint lookahead_pos, mz_uint max_dist, mz_uint max_match_len, mz_uint match_len, size_t probe_pos)
+   lookahead_pos and match_len again, so that this loop keeps neither.
+   Task miniz-0051: the same start, compiled twice. Where both budgets are known to be 3 or more
+   (long_budget, level 6), it is compiled into tdefl_find_match itself: a search without a candidate then
+   pays for no call, no passing of six values and no return, and one with a candidate for one call, not
+   two. Elsewhere it stays the function of its own that task miniz-0044 made (tdefl_find_match_first). */
+static MZ_FORCEINLINE mz_uint tdefl_find_match_first_body(const tdefl_compressor *d, mz_uint lookahead_pos, mz_uint max_dist, mz_uint max_match_len, mz_uint match_len, size_t probe_pos)
 {
     const mz_uint dist_base = max_dist - lookahead_pos;
     const mz_uint16 max_dist16 = (mz_uint16)max_dist;
@@ -1156,12 +1160,17 @@ static TDEFL_NOINLINE mz_uint tdefl_find_match_first(const tdefl_compressor *d, 
 #undef TDEFL_CHAIN_END
 }
 
+static TDEFL_NOINLINE mz_uint tdefl_find_match_first(const tdefl_compressor *d, mz_uint lookahead_pos, mz_uint max_dist, mz_uint max_match_len, mz_uint match_len, size_t probe_pos)
+{
+    return tdefl_find_match_first_body(d, lookahead_pos, max_dist, max_match_len, match_len, probe_pos);
+}
+
 /* Task miniz-0045: long_budget is nonzero only where both budgets of d->m_max_probes are known to be 3 or more
    (see tdefl_compress_normal): the test of the budget is then known to be true, and is left out. */
 static MZ_FORCEINLINE void tdefl_find_match(tdefl_compressor *d, mz_uint lookahead_pos, mz_uint max_dist, mz_uint max_match_len, mz_uint *pMatch_dist, mz_uint *pMatch_len, const mz_uint long_budget)
 {
     mz_uint dist, pos, match_len = *pMatch_len, probe_pos, next_probe_pos, probe_len;
-    mz_uint num_probes_left;
+    mz_uint num_probes_left, hint = 1; /* hint: see the hints below (read where long_budget is set only) */
     /* pTail pointe sur m_dict + match_len - 1 : les deux octets de fin de correspondance (positions
        match_len - 1 et match_len) se lisent en une fois par memcpy, sans calcul d'indice par sonde.
        L'égalité de deux mots lus de la même façon équivaut à celle des deux octets, quel que soit
@@ -1169,28 +1178,47 @@ static MZ_FORCEINLINE void tdefl_find_match(tdefl_compressor *d, mz_uint lookahe
     const mz_uint8 *pTail;
     mz_uint16 c01, w;
     MZ_ASSERT(max_match_len <= TDEFL_MAX_MATCH_LEN);
-    if (max_match_len <= match_len)
+    (void)hint;
+    /* Task miniz-0051: where long_budget is set, the test that ends the search (no room for a longer
+       match) and the test that guards the hints below (max_match_len > match_len + 1) are made as one,
+       which is false at almost every position: the second is made only when the first one holds. The
+       budget is read only where it is tested (not at all where long_budget is set: the start of the
+       general search reads it itself). */
+    if (long_budget)
+    {
+        if (max_match_len <= match_len + 1)
+        {
+            if (max_match_len <= match_len)
+                return;
+            hint = 0;
+        }
+    }
+    else if (max_match_len <= match_len)
         return;
-    num_probes_left = d->m_max_probes[match_len >= 32];
     /* Recherche courte (tâche miniz-0038) : avec un budget de 1 ou 2 (niveau 1), la recherche générale
        fait au plus trois sondes et au plus une comparaison, après laquelle le budget est épuisé. Mêmes
        sondes, dans le même ordre, et même comparaison, écrites en ligne droite : la mise en place de
        la recherche générale (tdefl_find_match_long) n'est payée que par les budgets plus grands. */
-    if ((long_budget) || ((num_probes_left - 1U) > 1U))
+    if ((long_budget) || (((num_probes_left = d->m_max_probes[match_len >= 32]) - 1U) > 1U))
     {
         mz_uint found;
 #if defined(__GNUC__) || defined(__clang__)
         /* The probes wait on memory more than on instructions: m_next and m_dict do not fit the first
            cache together, and each probe's address comes from the one before. The search of the next
-           position cannot start before this one ends, but the start of its chain is known now:
-           position lookahead_pos + 1 is in the chains as soon as the lookahead holds 4 bytes (the last
-           position inserted is lookahead_pos + lookahead_size - 3), so its m_next is written, and so
-           is the m_next of the position it names (an earlier position, or 0). Ask, while this search
-           runs, for the lines the first probes of the next one read: the first link's m_next and
-           m_dict, and the second link's m_next. Hints only, which change no result. */
-        if (max_match_len > TDEFL_MIN_MATCH_LEN)
+           position cannot start before this one ends, but the start of its chain is known now. Task
+           miniz-0051: the next position searched is lookahead_pos + match_len - 1 unless this search
+           finds a longer match: lookahead_pos + 1 when no match is held (match_len is
+           TDEFL_MIN_MATCH_LEN - 1), and, when a match of match_len bytes is held from the position
+           before, the position after that match (it is recorded, and match_len - 1 bytes are passed).
+           That position is in the chains as soon as max_match_len > match_len + 1 (max_match_len is
+           the lookahead's size, and the last position inserted is lookahead_pos + max_match_len - 3),
+           so its m_next is written, and so is the m_next of the position it names (an earlier
+           position, or 0). Ask, while this search runs, for the lines the first probes of the next
+           one read: the first link's m_next and m_dict, and the second link's m_next. Hints only,
+           which change no result. */
+        if (long_budget ? hint : (max_match_len > match_len + 1))
         {
-            const size_t next_first = d->m_next[(lookahead_pos + 1) & TDEFL_LZ_DICT_SIZE_MASK] & TDEFL_LZ_DICT_SIZE_MASK;
+            const size_t next_first = d->m_next[(lookahead_pos + match_len - 1) & TDEFL_LZ_DICT_SIZE_MASK] & TDEFL_LZ_DICT_SIZE_MASK;
             __builtin_prefetch(&d->m_next[next_first]);
             __builtin_prefetch(d->m_dict + next_first);
             __builtin_prefetch(&d->m_next[d->m_next[next_first] & TDEFL_LZ_DICT_SIZE_MASK]);
@@ -1203,7 +1231,7 @@ static MZ_FORCEINLINE void tdefl_find_match(tdefl_compressor *d, mz_uint lookahe
             const mz_uint first = d->m_next[lookahead_pos & TDEFL_LZ_DICT_SIZE_MASK];
             if ((!first) || ((mz_uint16)(lookahead_pos - first) > max_dist))
                 return;
-            found = tdefl_find_match_first(d, lookahead_pos, max_dist, max_match_len, match_len, first);
+            found = long_budget ? tdefl_find_match_first_body(d, lookahead_pos, max_dist, max_match_len, match_len, first) : tdefl_find_match_first(d, lookahead_pos, max_dist, max_match_len, match_len, first);
         }
         if (found)
         {
