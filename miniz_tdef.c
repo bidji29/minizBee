@@ -981,12 +981,12 @@ static mz_bool tdefl_compress_lz_codes(tdefl_compressor *d)
     }
 #else
 /* Longueur commune de p et q, plafonnée à max_match_len : par mots de 64 bits tant qu'il reste au
-   moins 8 octets sous le plafond, puis octet par octet (voir TDEFL_FIND_MATCH_64BIT plus haut). */
-static MZ_FORCEINLINE mz_uint tdefl_match_length(const mz_uint8 *p, const mz_uint8 *q, mz_uint max_match_len)
+   moins 8 octets sous le plafond, puis octet par octet (voir TDEFL_FIND_MATCH_64BIT plus haut).
+   Task miniz-0053: the comparison starts at probe_len, with p and q already advanced by probe_len
+   bytes that are known to be equal (0 for the whole comparison). */
+static MZ_FORCEINLINE mz_uint tdefl_match_length_from(const mz_uint8 *p, const mz_uint8 *q, mz_uint max_match_len, mz_uint probe_len)
 {
-    mz_uint probe_len;
 #if TDEFL_FIND_MATCH_64BIT
-    probe_len = 0;
     while ((max_match_len - probe_len) >= 8)
     {
         mz_uint64 wp, wq, x;
@@ -1006,12 +1006,52 @@ static MZ_FORCEINLINE mz_uint tdefl_match_length(const mz_uint8 *p, const mz_uin
         probe_len++;
     }
 #else
-    for (probe_len = 0; probe_len < max_match_len; probe_len++)
+    for (; probe_len < max_match_len; probe_len++)
         if (*p++ != *q++)
             break;
 #endif
     return probe_len;
 }
+
+static MZ_FORCEINLINE mz_uint tdefl_match_length(const mz_uint8 *p, const mz_uint8 *q, mz_uint max_match_len)
+{
+    return tdefl_match_length_from(p, q, max_match_len, 0);
+}
+
+#if TDEFL_FIND_MATCH_64BIT
+/* Task miniz-0053: the same comparison for the short search of tdefl_find_match (level 1), between
+   dict + pos and dict + probe_pos. Most of its comparisons end in their first word (a match shorter
+   than 8 bytes, under a ceiling of 8 or more): that word is compared in line, in a straight line,
+   read at its index. Whatever it does not settle (8 equal bytes, or a ceiling under 8) goes to
+   tdefl_match_length_rest, out of line, which runs the loop above from where the first word stopped:
+   the straight line then pays for none of the loop's setup, nor for the registers the loop would take
+   from the caller. Same reads, same lengths. */
+static __attribute__((__noinline__)) mz_uint tdefl_match_length_rest(const mz_uint8 *dict, size_t pos, size_t probe_pos, mz_uint max_match_len)
+{
+    if (max_match_len >= 8)
+        return tdefl_match_length_from(dict + pos + 8, dict + probe_pos + 8, max_match_len, 8);
+    return tdefl_match_length_from(dict + pos, dict + probe_pos, max_match_len, 0);
+}
+
+static MZ_FORCEINLINE mz_uint tdefl_match_length_short(const mz_uint8 *dict, size_t pos, size_t probe_pos, mz_uint max_match_len)
+{
+    if (__builtin_expect(max_match_len >= 8, 1))
+    {
+        mz_uint64 wp, wq, x;
+        memcpy(&wp, dict + pos, sizeof(wp));
+        memcpy(&wq, dict + probe_pos, sizeof(wq));
+        x = wp ^ wq;
+        /* No instruction: x is held in a register and tested there, where the compiler would otherwise
+           keep both words to compare them again (TDEFL_FIND_MATCH_64BIT implies gcc or clang). */
+        __asm__("" : "+r"(x));
+        if (__builtin_expect(x != 0, 1))
+            return (mz_uint)(__builtin_ctzll(x) >> 3);
+    }
+    return tdefl_match_length_rest(dict, pos, probe_pos, max_match_len);
+}
+#else
+#define tdefl_match_length_short(dict, pos, probe_pos, max_match_len) tdefl_match_length((dict) + (pos), (dict) + (probe_pos), max_match_len)
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TDEFL_NOINLINE __attribute__((__noinline__))
@@ -1232,7 +1272,7 @@ static MZ_FORCEINLINE void tdefl_find_match(tdefl_compressor *d, mz_uint lookahe
 candidat_court:
     if (!dist)
         return;
-    probe_len = tdefl_match_length(d->m_dict + pos, d->m_dict + probe_pos, max_match_len);
+    probe_len = tdefl_match_length_short(d->m_dict, pos, probe_pos, max_match_len);
     if (probe_len > match_len)
     {
         *pMatch_dist = dist;
