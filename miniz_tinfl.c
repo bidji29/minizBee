@@ -501,7 +501,7 @@ extern "C"
                         }
                         else
                         {
-                            int sym2;
+                            int sym1, sym2;
                             mz_uint code_len;
 #if TINFL_USE_64BIT_BITBUF
                             if (num_bits < 30)
@@ -518,25 +518,39 @@ extern "C"
                             num_bits += 16;
                         }
 #endif /* TINFL_USE_64BIT_BITBUF */
-                            if ((sym2 = r->m_look_up[0][bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)]) >= 0)
-                                code_len = sym2 >> 9;
-                            else
+                            /* An entry of the fast table is (length << 9) | symbol, with a length of 1 to
+                               TINFL_FAST_LOOKUP_BITS: 512 or more. One comparison therefore tells the usual case
+                               from the two rare ones: a negative entry (a longer code, read in the tree, whose
+                               length is never 0) and an entry below 512 (length 0: no code has these bits). */
+                            if ((sym1 = r->m_look_up[0][bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)]) >= 512)
+                            {
+                                bit_buf >>= (sym1 >> 9);
+                                num_bits -= (sym1 >> 9);
+                            }
+                            else if (sym1 < 0)
                             {
                                 code_len = TINFL_FAST_LOOKUP_BITS;
                                 do
                                 {
-                                    sym2 = r->m_tree_0[~sym2 + ((bit_buf >> code_len++) & 1)];
-                                } while (sym2 < 0);
+                                    sym1 = r->m_tree_0[~sym1 + ((bit_buf >> code_len++) & 1)];
+                                } while (sym1 < 0);
+                                bit_buf >>= code_len;
+                                num_bits -= code_len;
                             }
-                            counter = sym2;
-                            bit_buf >>= code_len;
-                            num_bits -= code_len;
-                            if (code_len == 0)
+                            else
                             {
+                                counter = sym1;
                                 TINFL_CR_RETURN_FOREVER(40, TINFL_STATUS_FAILED);
                             }
-                            if (counter & 256)
+                            /* A literal stays in a local variable: counter is assigned only when the loop is left
+                               with a length or the end of the block, which is all that is read of it afterwards
+                               (the next symbol decoded assigns it before anything reads it, also when the
+                               coroutine stops in between and comes back). */
+                            if (sym1 & 256)
+                            {
+                                counter = sym1;
                                 break;
+                            }
 
 #if !TINFL_USE_64BIT_BITBUF
                             if (num_bits < 15)
@@ -546,24 +560,28 @@ extern "C"
                                 num_bits += 16;
                             }
 #endif /* !TINFL_USE_64BIT_BITBUF */
-                            if ((sym2 = r->m_look_up[0][bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)]) >= 0)
-                                code_len = sym2 >> 9;
-                            else
+                            if ((sym2 = r->m_look_up[0][bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)]) >= 512)
+                            {
+                                bit_buf >>= (sym2 >> 9);
+                                num_bits -= (sym2 >> 9);
+                            }
+                            else if (sym2 < 0)
                             {
                                 code_len = TINFL_FAST_LOOKUP_BITS;
                                 do
                                 {
                                     sym2 = r->m_tree_0[~sym2 + ((bit_buf >> code_len++) & 1)];
                                 } while (sym2 < 0);
+                                bit_buf >>= code_len;
+                                num_bits -= code_len;
                             }
-                            bit_buf >>= code_len;
-                            num_bits -= code_len;
-                            if (code_len == 0)
+                            else
                             {
+                                counter = sym1;
                                 TINFL_CR_RETURN_FOREVER(54, TINFL_STATUS_FAILED);
                             }
 
-                            pOut_buf_cur[0] = (mz_uint8)counter;
+                            pOut_buf_cur[0] = (mz_uint8)sym1;
                             if (sym2 & 256)
                             {
                                 pOut_buf_cur++;
