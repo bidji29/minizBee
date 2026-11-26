@@ -289,6 +289,11 @@ extern "C"
         const mz_uint8 *pIn_buf_cur = pIn_buf_next, *const pIn_buf_end = pIn_buf_next + *pIn_buf_size;
         mz_uint8 *pOut_buf_cur = pOut_buf_next, *const pOut_buf_end = pOut_buf_next ? pOut_buf_next + *pOut_buf_size : NULL;
         size_t out_buf_size_mask = (decomp_flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF) ? (size_t)-1 : ((pOut_buf_next - pOut_buf_start) + *pOut_buf_size) - 1, dist_from_out_buf_start;
+        /* The fast loop's room test, as two pointer comparisons: pIn_buf_cur < pIn_fast_end holds exactly when
+           TINFL_FAST_IN_BYTES bytes of input or more are left, pOut_buf_cur < pOut_fast_end when 2 bytes of output
+           or more are left. A buffer too small for that gets a limit at its start, which no pointer is below. */
+        const mz_uint8 *const pIn_fast_end = (*pIn_buf_size >= TINFL_FAST_IN_BYTES) ? pIn_buf_end - (TINFL_FAST_IN_BYTES - 1) : pIn_buf_next;
+        mz_uint8 *const pOut_fast_end = (pOut_buf_next && *pOut_buf_size) ? pOut_buf_end - 1 : pOut_buf_next;
 
         /* Ensure the output buffer's size is a power of 2, unless the output buffer is large enough to hold the entire output file (in which case it doesn't matter). */
         if (((out_buf_size_mask + 1) & out_buf_size_mask) || (pOut_buf_next < pOut_buf_start))
@@ -513,7 +518,7 @@ extern "C"
                     size_t room; /* bytes from the higher of destination and source to the end of the buffer */
                     for (;;)
                     {
-                        if (((pIn_buf_end - pIn_buf_cur) < TINFL_FAST_IN_BYTES) || ((pOut_buf_end - pOut_buf_cur) < 2))
+                        if ((pIn_buf_cur >= pIn_fast_end) || (pOut_buf_cur >= pOut_fast_end))
                         {
                             TINFL_HUFF_DECODE(23, counter, r->m_look_up[0], r->m_tree_0);
                             if (counter >= 256)
@@ -556,10 +561,10 @@ extern "C"
                             counter = sym2;
                             bit_buf >>= code_len;
                             num_bits -= code_len;
-                            if (code_len == 0)
-                            {
-                                TINFL_CR_RETURN_FOREVER(40, TINFL_STATUS_FAILED);
-                            }
+                            /* code_len == 0 (an entry of the table that no code reaches, which is 0) is tested after
+                               the second code only: such an entry is a literal, and since it takes no bit, the second
+                               code is looked up at the same bits, finds the same entry, and fails below before
+                               anything is written. */
                             if (counter & 256)
                                 TINFL_FAST_MATCH_BREAK;
 
